@@ -514,8 +514,43 @@ public:
         : result_(std::make_unique<spqr_rust::RustSPQRResult>(g.raw())),
           view_(*result_),
           gccGraph_(&g) { buildTree(); }
-    
-    tree_node rootNode() const { return node{0u}; }
+
+    /**
+     * Build via SP-Compress + Reconstruct
+     *
+     * contractible[v] != 0 iff vertex v is eligible for Series compression
+     * (for example any non-pole interior vertex of the biconnected block)
+     */
+    StaticSPQRTree(const Graph& g, const uint8_t* contractible, uint32_t contractible_len)
+        : result_(buildViaSpCompress_(g, contractible, contractible_len)),
+          view_(*result_),
+          gccGraph_(&g) {
+        buildTree();
+    }
+
+private:
+    static std::unique_ptr<spqr_rust::RustSPQRResult> buildViaSpCompress_(
+        const Graph& g, const uint8_t* contractible, uint32_t contractible_len)
+    {
+        const uint32_t n_nodes = static_cast<uint32_t>(g.numberOfNodes());
+        const uint32_t n_edges = static_cast<uint32_t>(g.numberOfEdges());
+        std::vector<SpCompressInputEdge> in_edges;
+        in_edges.reserve(n_edges);
+        for (uint32_t i = 0; i < n_edges; ++i) {
+            uint32_t u = spqr_graph_edge_src(g.raw().raw(), i);
+            uint32_t v = spqr_graph_edge_dst(g.raw().raw(), i);
+            in_edges.push_back(SpCompressInputEdge{ u, v, i });
+        }
+        return std::make_unique<spqr_rust::RustSPQRResult>(
+            n_nodes,
+            in_edges.empty() ? nullptr : in_edges.data(),
+            n_edges,
+            contractible,
+            contractible_len);
+    }
+
+public:
+    tree_node rootNode() const { return node{view_.root}; }
     uint32_t numberOfNodes() const { return view_.numNodes; }
     NodeType typeOf(tree_node tn) const { return view_.nodeTypes[tn.idx] == 0 ? NodeType::SNode : view_.nodeTypes[tn.idx] == 1 ? NodeType::PNode : NodeType::RNode; }
     const TreeGraph& tree() const { return tree_; }
@@ -596,7 +631,6 @@ public:
 
         node firstNode() const { return nNodes_ > 0 ? node{0u} : node{}; }
 
-        // O(deg(v)) after a single O(E_skel) build on first call.
         template<typename F>
         void forEachAdj(node v, F&& f) const {
             buildAdj_();
@@ -1194,14 +1228,60 @@ public:
     using SkeletonEdge = ::SkeletonEdge;
     
     explicit StaticSPQRTree(const Graph& g) : result_(std::make_unique<spqr_rust::RustSPQRResult>(g.raw())), view_(*result_) { buildTree(); }
-    
-    tree_node rootNode() const { return node{0u}; }
+
+    /**
+     * Build via SP-Compress + Reconstruct.
+     *
+     * contractible is a byte mask indexed by node ID: contractible[v] != 0
+     * iff vertex v is eligible for Series compression. Typically, the caller
+     * marks every interior vertex of the biconnected block (= all vertices
+     * except the BC-tree poles, or equivalently every vertex whose degree in
+     * the block equals its degree in the global graph minus 0... in practice,
+     * just all vertices that are not BCcut vertices)
+     *
+     * The SPQR tree returned is isomorphic to that of the regular
+     * constructor StaticSPQRTree(const Graph&) (modulo as permutation of skeleton 
+     * edges and children).
+     */
+    StaticSPQRTree(const Graph& g, const uint8_t* contractible, uint32_t contractible_len)
+        : result_(buildViaSpCompress_(g, contractible, contractible_len)),
+          view_(*result_) {
+        buildTree();
+    }
+
+private:
+    static std::unique_ptr<spqr_rust::RustSPQRResult> buildViaSpCompress_(
+        const Graph& g, const uint8_t* contractible, uint32_t contractible_len)
+    {
+        const uint32_t n_nodes = static_cast<uint32_t>(g.numberOfNodes());
+        const uint32_t n_edges = static_cast<uint32_t>(g.numberOfEdges());
+
+        // Materialize edges into the FFI representation.
+        std::vector<SpCompressInputEdge> in_edges;
+        in_edges.reserve(n_edges);
+        for (uint32_t i = 0; i < n_edges; ++i) {
+            edge e{i};
+            // Use the raw graph to get src/dst.
+            uint32_t u = spqr_graph_edge_src(g.raw().raw(), i);
+            uint32_t v = spqr_graph_edge_dst(g.raw().raw(), i);
+            in_edges.push_back(SpCompressInputEdge{ u, v, i });
+        }
+
+        return std::make_unique<spqr_rust::RustSPQRResult>(
+            n_nodes,
+            in_edges.empty() ? nullptr : in_edges.data(),
+            n_edges,
+            contractible,
+            contractible_len);
+    }
+
+public:
+    tree_node rootNode() const { return node{view_.root}; }
     uint32_t numberOfNodes() const { return view_.numNodes; }
     NodeType typeOf(tree_node tn) const { return view_.nodeTypes[tn.idx] == 0 ? NodeType::SNode : view_.nodeTypes[tn.idx] == 1 ? NodeType::PNode : NodeType::RNode; }
     const TreeGraph& tree() const { return tree_; }
     tree_node parent(tree_node tn) const { return node{parents_[tn.idx]}; }
 
-    // V2: expose flat view for zero-alloc direct iteration.
     const spqr_rust::SpqrTreeFlatView& flatView() const { return view_; }
     
     class SkeletonGraph {

@@ -50,6 +50,9 @@ void spqr_graph_free(SpqrGraphFFI* graph);
 uint64_t spqr_get_fast_cycle_hits(void);
 uint64_t spqr_get_fast_cycle_calls(void);
 
+void spqr_set_canonicalize_root_enabled(uint8_t enabled);
+uint8_t spqr_get_canonicalize_root_enabled(void);
+
 // returns ID of first added node
 uint32_t spqr_graph_add_nodes(SpqrGraphFFI* graph, uint32_t count);
 uint32_t spqr_graph_add_edge(SpqrGraphFFI* graph, uint32_t u, uint32_t v);

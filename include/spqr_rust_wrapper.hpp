@@ -7,6 +7,7 @@
 #define SPQR_RUST_WRAPPER_HPP
 
 #include "spqr_tree.h"
+#include "sp_compress.h"
 #include <vector>
 #include <memory>
 #include <stdexcept>
@@ -183,6 +184,18 @@ public:
     explicit RustSPQRResult(const RustGraph& graph)
         : result_(spqr_build(graph.raw())) {
         if (!result_) throw std::runtime_error("Failed to build SPQR tree");
+    }
+
+    RustSPQRResult(uint32_t n_nodes,
+                   const SpCompressInputEdge* edges,
+                   uint32_t edges_len,
+                   const uint8_t* contractible,
+                   uint32_t contractible_len)
+        : result_(sp_compress_reconstruct_ffi(
+              n_nodes, edges, edges_len, contractible, contractible_len)) {
+        if (!result_) {
+            throw std::runtime_error("sp_compress_reconstruct_ffi failed");
+        }
     }
 
     ~RustSPQRResult() {

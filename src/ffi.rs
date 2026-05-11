@@ -26,6 +26,20 @@ pub extern "C" fn spqr_get_fast_cycle_calls() -> u64 {
 }
 
 #[no_mangle]
+pub extern "C" fn spqr_set_canonicalize_root_enabled(enabled: u8) {
+    crate::CANONICALIZE_ROOT_ENABLED.store(enabled != 0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[no_mangle]
+pub extern "C" fn spqr_get_canonicalize_root_enabled() -> u8 {
+    if crate::CANONICALIZE_ROOT_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        1
+    } else {
+        0
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn spqr_graph_new(node_capacity: u32, edge_capacity: u32) -> *mut Graph {
     Box::into_raw(Box::new(Graph::with_capacity(
         node_capacity as usize,

@@ -8,10 +8,38 @@
 #![deny(unsafe_code)]
 #![allow(clippy::needless_range_loop)]
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+use std::thread;
+
+pub static CANONICALIZE_ROOT_ENABLED: AtomicBool = AtomicBool::new(true);
+
+static SPQR_THREAD_COUNT: OnceLock<usize> = OnceLock::new();
+
+pub(crate) fn spqr_thread_count() -> usize {
+    *SPQR_THREAD_COUNT.get_or_init(|| {
+        let from_env = |name: &str| -> Option<usize> {
+            let raw = std::env::var(name).ok()?;
+            let first = raw.split(',').next().unwrap_or(raw.as_str()).trim();
+            let value = first.parse::<usize>().ok()?;
+            (value > 0).then_some(value)
+        };
+        let requested = from_env("BF_SPQR_THREADS")
+            .or_else(|| from_env("OMP_NUM_THREADS"))
+            .or_else(|| from_env("RAYON_NUM_THREADS"))
+            .unwrap_or(1);
+        let available = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        requested.min(available).max(1)
+    })
+}
+
 pub mod biconnected;
 pub mod connected;
 #[allow(unsafe_code)]
 pub mod ffi;
+pub mod sp_compress;
 pub mod spqr_format;
 pub mod verify;
 
@@ -23,6 +51,7 @@ pub use connected::{
 
 use std::collections::HashMap;
 use std::fmt;
+use std::time::Instant;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(pub u32);
@@ -354,6 +383,7 @@ pub struct SpqrTreeNodeView<'a> {
     pub children: &'a [TreeNodeId],
 }
 
+#[derive(Clone)]
 pub struct SpqrTree {
     pub root: TreeNodeId,
     pub node_types: Vec<SpqrNodeType>,
@@ -366,6 +396,7 @@ pub struct SpqrTree {
     pub node_mapping: Vec<NodeId>,
     pub skeleton_num_nodes: Vec<u32>,
     pub edge_to_tree_node: Vec<TreeNodeId>,
+    pub min_real_per_node: Vec<u32>,
 }
 
 impl SpqrTree {
@@ -476,6 +507,7 @@ impl SpqrTree {
             node_mapping: Vec::new(),
             skeleton_num_nodes: Vec::new(),
             edge_to_tree_node: vec![TreeNodeId::INVALID; num_edges],
+            min_real_per_node: Vec::new(),
         }
     }
 
@@ -487,9 +519,13 @@ impl SpqrTree {
         node_to_original: Vec<NodeId>,
     ) -> Self {
         let mut edge_to_tree_node = vec![TreeNodeId::INVALID; num_edges];
+        let mut min_real: u32 = u32::MAX;
         for edge in &edges {
             if edge.real_edge.is_valid() {
                 edge_to_tree_node[edge.real_edge.idx()] = TreeNodeId(0);
+                if edge.real_edge.0 < min_real {
+                    min_real = edge.real_edge.0;
+                }
             }
         }
 
@@ -505,6 +541,7 @@ impl SpqrTree {
             node_mapping: node_to_original,
             skeleton_num_nodes: vec![num_skel_nodes],
             edge_to_tree_node,
+            min_real_per_node: vec![min_real],
         }
     }
 }
@@ -531,6 +568,7 @@ struct SpqrTreeBuilder {
     node_mapping_offsets: Vec<u32>,
     node_mapping: Vec<NodeId>,
     edge_to_tree_node: Vec<TreeNodeId>,
+    min_real_per_node: Vec<u32>,
 }
 
 impl SpqrTreeBuilder {
@@ -544,6 +582,7 @@ impl SpqrTreeBuilder {
             node_mapping_offsets: vec![0],
             node_mapping: Vec::new(),
             edge_to_tree_node: vec![TreeNodeId::INVALID; num_edges],
+            min_real_per_node: Vec::new(),
         }
     }
 
@@ -556,12 +595,16 @@ impl SpqrTreeBuilder {
     ) -> TreeNodeId {
         let tid = TreeNodeId(self.node_types.len() as u32);
 
-        // Mark real edges
+        let mut min_real: u32 = u32::MAX;
         for edge in &edges {
             if edge.real_edge.is_valid() {
                 self.edge_to_tree_node[edge.real_edge.idx()] = tid;
+                if edge.real_edge.0 < min_real {
+                    min_real = edge.real_edge.0;
+                }
             }
         }
+        self.min_real_per_node.push(min_real);
 
         self.node_types.push(node_type);
         self.node_parents.push(TreeNodeId::INVALID);
@@ -612,6 +655,7 @@ impl SpqrTreeBuilder {
             node_mapping: self.node_mapping,
             skeleton_num_nodes: self.skeleton_num_nodes,
             edge_to_tree_node: self.edge_to_tree_node,
+            min_real_per_node: self.min_real_per_node,
         }
     }
 
@@ -628,6 +672,7 @@ impl SpqrTreeBuilder {
             node_mapping: Vec::new(),
             skeleton_num_nodes: Vec::new(),
             edge_to_tree_node: self.edge_to_tree_node,
+            min_real_per_node: Vec::new(),
         }
     }
 }
@@ -646,7 +691,19 @@ struct SplitComponent {
     pole_b: u32,
 }
 
-// PUBLIC ENTRY POINTS HERE
+#[derive(Default, Clone, Copy, Debug)]
+pub(crate) struct SpqrRawBuildTimings {
+    pub t_self_loop_scan_us: u64,
+    pub t_tree_total_us: u64,
+    pub t_precheck_us: u64,
+    pub t_split_multi_edges_us: u64,
+    pub t_work_graph_us: u64,
+    pub t_triconn_us: u64,
+    pub t_relabel_us: u64,
+    pub t_combine_us: u64,
+    pub t_merge_us: u64,
+    pub t_assemble_us: u64,
+}
 
 /// Build an SPQR tree
 ///
@@ -664,8 +721,52 @@ pub fn build_spqr(graph: &Graph) -> SpqrResult {
         }
     }
 
+    let mut tree = build_spqr_tree_filtered(graph, &is_self_loop);
+    tree.canonicalize_root();
+    tree.canonicalize_skeleton_node_order();
+    tree.canonicalize_skeleton_edge_orientation();
+    tree.move_root_to_zero();
+    SpqrResult { tree, self_loops }
+}
+
+pub(crate) fn build_spqr_raw(graph: &Graph) -> SpqrResult {
+    let m = graph.num_edges();
+
+    let mut self_loops: Vec<EdgeId> = Vec::new();
+    let mut is_self_loop = vec![false; m];
+    for i in 0..m {
+        let e = graph.edge(EdgeId(i as u32));
+        if e.src == e.dst {
+            is_self_loop[i] = true;
+            self_loops.push(EdgeId(i as u32));
+        }
+    }
+
     let tree = build_spqr_tree_filtered(graph, &is_self_loop);
     SpqrResult { tree, self_loops }
+}
+
+pub(crate) fn build_spqr_raw_timed(graph: &Graph) -> (SpqrResult, SpqrRawBuildTimings) {
+    let m = graph.num_edges();
+    let mut timings = SpqrRawBuildTimings::default();
+
+    let t0 = Instant::now();
+    let mut self_loops: Vec<EdgeId> = Vec::new();
+    let mut is_self_loop = vec![false; m];
+    for i in 0..m {
+        let e = graph.edge(EdgeId(i as u32));
+        if e.src == e.dst {
+            is_self_loop[i] = true;
+            self_loops.push(EdgeId(i as u32));
+        }
+    }
+    timings.t_self_loop_scan_us = t0.elapsed().as_micros() as u64;
+
+    let t1 = Instant::now();
+    let tree = build_spqr_tree_filtered_impl(graph, &is_self_loop, Some(&mut timings));
+    timings.t_tree_total_us = t1.elapsed().as_micros() as u64;
+
+    (SpqrResult { tree, self_loops }, timings)
 }
 
 /// Build an SPQR tree from a graph known to contain no self loops
@@ -685,14 +786,33 @@ pub fn build_spqr_tree(graph: &Graph) -> SpqrTree {
 }
 
 fn build_spqr_tree_filtered(graph: &Graph, is_self_loop: &[bool]) -> SpqrTree {
+    build_spqr_tree_filtered_impl(graph, is_self_loop, None)
+}
+
+fn build_spqr_tree_filtered_impl(
+    graph: &Graph,
+    is_self_loop: &[bool],
+    mut timings: Option<&mut SpqrRawBuildTimings>,
+) -> SpqrTree {
+    macro_rules! add_timing {
+        ($field:ident, $start:expr) => {
+            if let Some(t) = timings.as_mut() {
+                t.$field += $start.elapsed().as_micros() as u64;
+            }
+        };
+    }
+
+    let t_precheck = Instant::now();
     let n = graph.num_nodes();
     let m = graph.num_edges();
     let m_real = m - is_self_loop.iter().filter(|&&b| b).count();
 
     if n == 0 || m_real == 0 {
+        add_timing!(t_precheck_us, t_precheck);
         return SpqrTree::empty(m);
     }
     if n == 1 {
+        add_timing!(t_precheck_us, t_precheck);
         return SpqrTree::empty(m);
     }
     if m_real == 1 {
@@ -712,6 +832,7 @@ fn build_spqr_tree_filtered(graph: &Graph, is_self_loop: &[bool]) -> SpqrTree {
             twin_tree_node: TreeNodeId::INVALID,
             twin_edge_idx: INVALID,
         }];
+        add_timing!(t_precheck_us, t_precheck);
         return SpqrTree::single_node(m, SpqrNodeType::P, 2, edges, vec![e.src, e.dst]);
     }
 
@@ -733,18 +854,24 @@ fn build_spqr_tree_filtered(graph: &Graph, is_self_loop: &[bool]) -> SpqrTree {
         }
     }
     if n == 2 || (all_between_01 && has_non_loop_node[0]) {
+        add_timing!(t_precheck_us, t_precheck);
         return build_parallel_case(graph, is_self_loop);
     }
 
     if let Some(tree) = try_build_simple_cycle(graph, is_self_loop) {
+        add_timing!(t_precheck_us, t_precheck);
         return tree;
     }
+    add_timing!(t_precheck_us, t_precheck);
 
     let mut next_virtual = m as u32;
+    let t_split = Instant::now();
     let (multi_comps, synthetic, consumed) =
         split_multi_edges(graph, &mut next_virtual, is_self_loop);
+    add_timing!(t_split_multi_edges_us, t_split);
 
     // Build working graph (exclude self loops AND consumed multi-edges)
+    let t_work_graph = Instant::now();
     let real_count = (0..m).filter(|&i| !consumed[i] && !is_self_loop[i]).count();
     let total = real_count + synthetic.len();
     let mut wg = Graph::with_capacity(n, total);
@@ -761,6 +888,7 @@ fn build_spqr_tree_filtered(graph: &Graph, is_self_loop: &[bool]) -> SpqrTree {
         wg.add_edge(NodeId(a), NodeId(b));
         weid_to_label.push(vid);
     }
+    add_timing!(t_work_graph_us, t_work_graph);
 
     let wg_m = wg.num_edges();
     let ref_weid = {
@@ -777,6 +905,7 @@ fn build_spqr_tree_filtered(graph: &Graph, is_self_loop: &[bool]) -> SpqrTree {
     let used_triconn = n >= 3 && wg_m >= 3 && ref_weid.is_valid();
 
     let empty_consumed: Vec<bool> = Vec::new();
+    let t_triconn = Instant::now();
     let mut wcomps = if used_triconn {
         triconn_decompose(&wg, ref_weid, &mut next_virtual, &empty_consumed)
     } else {
@@ -801,7 +930,9 @@ fn build_spqr_tree_filtered(graph: &Graph, is_self_loop: &[bool]) -> SpqrTree {
             }]
         }
     };
+    add_timing!(t_triconn_us, t_triconn);
 
+    let t_relabel = Instant::now();
     for comp in &mut wcomps {
         for se in &mut comp.edges {
             let i = se.eid as usize;
@@ -810,17 +941,27 @@ fn build_spqr_tree_filtered(graph: &Graph, is_self_loop: &[bool]) -> SpqrTree {
             }
         }
     }
+    add_timing!(t_relabel_us, t_relabel);
 
+    let t_combine = Instant::now();
     let mut all = combine_components(multi_comps, wcomps, &mut next_virtual);
-    merge_same_type_components(&mut all, m);
+    add_timing!(t_combine_us, t_combine);
 
-    assemble_spqr_tree(graph, &all, next_virtual)
+    let t_merge = Instant::now();
+    merge_same_type_components(&mut all, m);
+    add_timing!(t_merge_us, t_merge);
+
+    let t_assemble = Instant::now();
+    let tree = assemble_spqr_tree(graph, &all, next_virtual);
+    add_timing!(t_assemble_us, t_assemble);
+    tree
 }
 
 fn build_parallel_case(graph: &Graph, is_self_loop: &[bool]) -> SpqrTree {
     let m = graph.num_edges();
     let mut edges = Vec::new();
     let mut edge_to_tree_node = vec![TreeNodeId::INVALID; m];
+    let mut min_real: u32 = u32::MAX;
 
     for i in 0..m {
         if is_self_loop[i] {
@@ -844,6 +985,9 @@ fn build_parallel_case(graph: &Graph, is_self_loop: &[bool]) -> SpqrTree {
             twin_edge_idx: INVALID,
         });
         edge_to_tree_node[i] = TreeNodeId(0);
+        if (i as u32) < min_real {
+            min_real = i as u32;
+        }
     }
 
     SpqrTree {
@@ -858,6 +1002,7 @@ fn build_parallel_case(graph: &Graph, is_self_loop: &[bool]) -> SpqrTree {
         node_mapping: vec![NodeId(0), NodeId(1)],
         skeleton_num_nodes: vec![2],
         edge_to_tree_node,
+        min_real_per_node: vec![min_real],
     }
 }
 
@@ -956,54 +1101,172 @@ fn split_multi_edges(
     next_virtual: &mut u32,
     is_self_loop: &[bool],
 ) -> (Vec<SplitComponent>, Vec<(u32, u32, u32)>, Vec<bool>) {
+    #[derive(Clone, Copy)]
+    struct PairEdge {
+        key: u64,
+        eid: u32,
+    }
+
+    #[inline]
+    fn pair_key(a: u32, b: u32) -> u64 {
+        let lo = a.min(b) as u64;
+        let hi = a.max(b) as u64;
+        (lo << 32) | hi
+    }
+
+    #[inline]
+    fn key_endpoints(key: u64) -> (u32, u32) {
+        ((key >> 32) as u32, key as u32)
+    }
+
+    fn emit_parallel_group(
+        key: u64,
+        eids: &[u32],
+        graph: &Graph,
+        next_virtual: &mut u32,
+        p_comps: &mut Vec<SplitComponent>,
+        consumed: &mut [bool],
+        synthetic: &mut Vec<(u32, u32, u32)>,
+    ) {
+        if eids.len() < 2 {
+            return;
+        }
+        let (a, b) = key_endpoints(key);
+        let vid = *next_virtual;
+        *next_virtual += 1;
+        let mut edges: Vec<StackEdge> = Vec::with_capacity(eids.len() + 1);
+        for &eid in eids {
+            let e = graph.edge(EdgeId(eid));
+            edges.push(StackEdge {
+                src: e.src.0,
+                dst: e.dst.0,
+                eid,
+            });
+            consumed[eid as usize] = true;
+        }
+        edges.push(StackEdge {
+            src: a,
+            dst: b,
+            eid: vid,
+        });
+        p_comps.push(SplitComponent {
+            edges,
+            pole_a: a,
+            pole_b: b,
+        });
+        synthetic.push((a, b, vid));
+    }
+
     let m = graph.num_edges();
-    let mut pair_to_eids: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
+    let mut pairs: Vec<PairEdge> = Vec::with_capacity(m);
     for i in 0..m {
         if is_self_loop[i] {
             continue;
         }
         let e = graph.edge(EdgeId(i as u32));
-        let (a, b) = if e.src.0 <= e.dst.0 {
-            (e.src.0, e.dst.0)
-        } else {
-            (e.dst.0, e.src.0)
-        };
-        pair_to_eids.entry((a, b)).or_default().push(i as u32);
+        pairs.push(PairEdge {
+            key: pair_key(e.src.0, e.dst.0),
+            eid: i as u32,
+        });
     }
     let mut p_comps = Vec::new();
     let mut consumed = vec![false; m];
     let mut synthetic = Vec::new();
-    for (&(a, b), eids) in &pair_to_eids {
-        if eids.len() >= 2 {
-            let vid = *next_virtual;
-            *next_virtual += 1;
-            let mut edges: Vec<StackEdge> = eids
-                .iter()
-                .map(|&eid| {
-                    let e = graph.edge(EdgeId(eid));
-                    StackEdge {
-                        src: e.src.0,
-                        dst: e.dst.0,
-                        eid,
-                    }
-                })
-                .collect();
-            edges.push(StackEdge {
-                src: a,
-                dst: b,
-                eid: vid,
-            });
-            p_comps.push(SplitComponent {
-                edges,
-                pole_a: a,
-                pole_b: b,
-            });
-            for &eid in eids {
-                consumed[eid as usize] = true;
+
+    const MIN_PAR_SORT_EDGES: usize = 1_000_000;
+    let threads = spqr_thread_count().min(pairs.len().max(1));
+    if threads > 1 && pairs.len() >= MIN_PAR_SORT_EDGES {
+        let chunk = pairs.len().div_ceil(threads);
+        thread::scope(|scope| {
+            for chunk_pairs in pairs.chunks_mut(chunk) {
+                scope.spawn(move || {
+                    chunk_pairs.sort_unstable_by_key(|pe| (pe.key, pe.eid));
+                });
             }
-            synthetic.push((a, b, vid));
+        });
+
+        let mut ranges = Vec::new();
+        let mut start = 0usize;
+        while start < pairs.len() {
+            let end = (start + chunk).min(pairs.len());
+            ranges.push((start, end));
+            start = end;
+        }
+
+        let mut heap = std::collections::BinaryHeap::new();
+        for (chunk_id, &(start, end)) in ranges.iter().enumerate() {
+            if start < end {
+                let pe = pairs[start];
+                heap.push(std::cmp::Reverse((pe.key, pe.eid, chunk_id, start)));
+            }
+        }
+
+        let mut current_key: Option<u64> = None;
+        let mut current_eids: Vec<u32> = Vec::new();
+        while let Some(std::cmp::Reverse((key, eid, chunk_id, pos))) = heap.pop() {
+            if current_key != Some(key) {
+                if let Some(prev_key) = current_key {
+                    emit_parallel_group(
+                        prev_key,
+                        &current_eids,
+                        graph,
+                        next_virtual,
+                        &mut p_comps,
+                        &mut consumed,
+                        &mut synthetic,
+                    );
+                }
+                current_key = Some(key);
+                current_eids.clear();
+            }
+            current_eids.push(eid);
+
+            let next_pos = pos + 1;
+            let (_, end) = ranges[chunk_id];
+            if next_pos < end {
+                let pe = pairs[next_pos];
+                heap.push(std::cmp::Reverse((pe.key, pe.eid, chunk_id, next_pos)));
+            }
+        }
+        if let Some(prev_key) = current_key {
+            emit_parallel_group(
+                prev_key,
+                &current_eids,
+                graph,
+                next_virtual,
+                &mut p_comps,
+                &mut consumed,
+                &mut synthetic,
+            );
+        }
+    } else {
+        pairs.sort_unstable_by_key(|pe| (pe.key, pe.eid));
+        let mut i = 0usize;
+        while i < pairs.len() {
+            let key = pairs[i].key;
+            let start = i;
+            i += 1;
+            while i < pairs.len() && pairs[i].key == key {
+                i += 1;
+            }
+            if i - start >= 2 {
+                let mut eids = Vec::with_capacity(i - start);
+                for pe in &pairs[start..i] {
+                    eids.push(pe.eid);
+                }
+                emit_parallel_group(
+                    key,
+                    &eids,
+                    graph,
+                    next_virtual,
+                    &mut p_comps,
+                    &mut consumed,
+                    &mut synthetic,
+                );
+            }
         }
     }
+
     (p_comps, synthetic, consumed)
 }
 
@@ -1108,13 +1371,17 @@ fn triconn_decompose(
                     let pv = p.v as usize;
                     nd_arr[pv] += nd_arr[v as usize];
                     let (a, b) = (lp1[v as usize], lp2[v as usize]);
-                    if a < lp1[pv] {
-                        lp2[pv] = std::cmp::min(lp1[pv], b);
-                        lp1[pv] = a;
-                    } else if a == lp1[pv] {
-                        lp2[pv] = std::cmp::min(lp2[pv], b);
-                    } else {
-                        lp2[pv] = std::cmp::min(lp2[pv], a);
+                    match a.cmp(&lp1[pv]) {
+                        std::cmp::Ordering::Less => {
+                            lp2[pv] = std::cmp::min(lp1[pv], b);
+                            lp1[pv] = a;
+                        }
+                        std::cmp::Ordering::Equal => {
+                            lp2[pv] = std::cmp::min(lp2[pv], b);
+                        }
+                        std::cmp::Ordering::Greater => {
+                            lp2[pv] = std::cmp::min(lp2[pv], a);
+                        }
                     }
                 }
                 continue;
@@ -1142,11 +1409,15 @@ fn triconn_decompose(
             } else {
                 etype_orig[ei] = 2;
                 let nw = number[w as usize];
-                if nw < lp1[v as usize] {
-                    lp2[v as usize] = lp1[v as usize];
-                    lp1[v as usize] = nw;
-                } else if nw > lp1[v as usize] {
-                    lp2[v as usize] = std::cmp::min(lp2[v as usize], nw);
+                match nw.cmp(&lp1[v as usize]) {
+                    std::cmp::Ordering::Less => {
+                        lp2[v as usize] = lp1[v as usize];
+                        lp1[v as usize] = nw;
+                    }
+                    std::cmp::Ordering::Equal => {}
+                    std::cmp::Ordering::Greater => {
+                        lp2[v as usize] = std::cmp::min(lp2[v as usize], nw);
+                    }
                 }
             }
         }
@@ -1910,8 +2181,20 @@ fn combine_components(
     work: Vec<SplitComponent>,
     next_virtual: &mut u32,
 ) -> Vec<SplitComponent> {
+    if std::env::var_os("BF_SPQR_PAR_COMBINE").is_some() {
+        return combine_components_parallel(multi, work, next_virtual);
+    }
+
     let mut out = multi;
-    let mut pending: Vec<SplitComponent> = work;
+    for comp in work.into_iter().rev() {
+        out.extend(combine_one_component(comp, next_virtual));
+    }
+    out
+}
+
+fn combine_one_component(comp: SplitComponent, next_virtual: &mut u32) -> Vec<SplitComponent> {
+    let mut out = Vec::new();
+    let mut pending: Vec<SplitComponent> = vec![comp];
     while let Some(comp) = pending.pop() {
         let parts = split_internal_parallels(comp, next_virtual);
         if parts.len() == 1 {
@@ -1919,6 +2202,110 @@ fn combine_components(
         } else {
             pending.extend(parts);
         }
+    }
+    out
+}
+
+struct CombinedComponentBatch {
+    parts: Vec<SplitComponent>,
+    local_virtuals: u32,
+}
+
+const LOCAL_VIRTUAL_BASE: u32 = 0xC000_0000;
+
+fn combine_components_parallel(
+    multi: Vec<SplitComponent>,
+    work: Vec<SplitComponent>,
+    next_virtual: &mut u32,
+) -> Vec<SplitComponent> {
+    const MIN_PAR_COMBINE_COMPONENTS: usize = 1024;
+
+    let n = work.len();
+    let threads = spqr_thread_count().min(n.max(1));
+    if threads <= 1 || n < MIN_PAR_COMBINE_COMPONENTS || *next_virtual >= LOCAL_VIRTUAL_BASE {
+        let mut out = multi;
+        for comp in work.into_iter().rev() {
+            out.extend(combine_one_component(comp, next_virtual));
+        }
+        return out;
+    }
+
+    let chunk = n.div_ceil(threads);
+    let mut chunks: Vec<Vec<(usize, SplitComponent)>> = Vec::new();
+    let mut cur: Vec<(usize, SplitComponent)> = Vec::with_capacity(chunk);
+    for (idx, comp) in work.into_iter().enumerate() {
+        cur.push((idx, comp));
+        if cur.len() == chunk {
+            chunks.push(cur);
+            cur = Vec::with_capacity(chunk);
+        }
+    }
+    if !cur.is_empty() {
+        chunks.push(cur);
+    }
+
+    let mut joined = Vec::with_capacity(chunks.len());
+    thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(chunks.len());
+        for chunk_jobs in chunks {
+            handles.push(scope.spawn(move || {
+                let mut local_results = Vec::with_capacity(chunk_jobs.len());
+                for (idx, comp) in chunk_jobs {
+                    let mut local_next = LOCAL_VIRTUAL_BASE;
+                    let parts = combine_one_component(comp, &mut local_next);
+                    local_results.push((
+                        idx,
+                        CombinedComponentBatch {
+                            parts,
+                            local_virtuals: local_next - LOCAL_VIRTUAL_BASE,
+                        },
+                    ));
+                }
+                local_results
+            }));
+        }
+        for handle in handles {
+            joined.push(
+                handle
+                    .join()
+                    .expect("parallel SPQR combine worker panicked"),
+            );
+        }
+    });
+
+    let mut batches: Vec<Option<CombinedComponentBatch>> = (0..n).map(|_| None).collect();
+    for local_results in joined {
+        for (idx, batch) in local_results {
+            batches[idx] = Some(batch);
+        }
+    }
+
+    let mut bases = vec![0u32; n];
+    let mut next = *next_virtual;
+    for idx in (0..n).rev() {
+        bases[idx] = next;
+        let count = batches[idx]
+            .as_ref()
+            .expect("missing parallel SPQR combine batch")
+            .local_virtuals;
+        next = next.saturating_add(count);
+    }
+    *next_virtual = next;
+
+    let mut out = multi;
+    for idx in (0..n).rev() {
+        let mut batch = batches[idx]
+            .take()
+            .expect("missing parallel SPQR combine batch");
+        let base = bases[idx];
+        for comp in &mut batch.parts {
+            for edge in &mut comp.edges {
+                if edge.eid >= LOCAL_VIRTUAL_BASE {
+                    edge.eid = base + (edge.eid - LOCAL_VIRTUAL_BASE);
+                }
+            }
+        }
+        out.extend(batch.parts);
     }
     out
 }
@@ -1995,19 +2382,58 @@ fn classify_component(comp: &SplitComponent) -> SpqrNodeType {
     SpqrNodeType::R
 }
 
-fn merge_same_type_components(comps: &mut Vec<SplitComponent>, m: usize) {
-    let ctype: Vec<SpqrNodeType> = comps.iter().map(classify_component).collect();
+fn classify_components_parallel(comps: &[SplitComponent]) -> Vec<SpqrNodeType> {
+    const MIN_PAR_COMPONENTS: usize = 4096;
+    let n = comps.len();
+    let threads = spqr_thread_count().min(n.max(1));
+    if threads <= 1 || n < MIN_PAR_COMPONENTS {
+        return comps.iter().map(classify_component).collect();
+    }
 
-    let mut comp1: HashMap<u32, usize> = HashMap::new();
-    let mut comp2: HashMap<u32, usize> = HashMap::new();
+    let mut out = vec![SpqrNodeType::R; n];
+    let chunk = n.div_ceil(threads);
+    thread::scope(|scope| {
+        for (out_chunk, comp_chunk) in out.chunks_mut(chunk).zip(comps.chunks(chunk)) {
+            scope.spawn(move || {
+                for (dst, comp) in out_chunk.iter_mut().zip(comp_chunk.iter()) {
+                    *dst = classify_component(comp);
+                }
+            });
+        }
+    });
+    out
+}
+
+fn merge_same_type_components(comps: &mut Vec<SplitComponent>, m: usize) {
+    let ctype = classify_components_parallel(comps);
+
+    let mut max_virtual_eid = m as u32;
+    for comp in comps.iter() {
+        for e in &comp.edges {
+            if (e.eid as usize) >= m && e.eid > max_virtual_eid {
+                max_virtual_eid = e.eid;
+            }
+        }
+    }
+
+    if (max_virtual_eid as usize) < m {
+        comps.retain(|c| !c.edges.is_empty());
+        return;
+    }
+
+    const INVALID_COMP: usize = usize::MAX;
+    let virtual_count = (max_virtual_eid as usize) - m + 1;
+    let mut comp1: Vec<usize> = vec![INVALID_COMP; virtual_count];
+    let mut comp2: Vec<usize> = vec![INVALID_COMP; virtual_count];
 
     for (ci, comp) in comps.iter().enumerate() {
         for e in &comp.edges {
             if (e.eid as usize) >= m {
-                if let std::collections::hash_map::Entry::Vacant(e) = comp1.entry(e.eid) {
-                    e.insert(ci);
+                let idx = (e.eid as usize) - m;
+                if comp1[idx] == INVALID_COMP {
+                    comp1[idx] = ci;
                 } else {
-                    comp2.insert(e.eid, ci);
+                    comp2[idx] = ci;
                 }
             }
         }
@@ -2033,12 +2459,17 @@ fn merge_same_type_components(comps: &mut Vec<SplitComponent>, m: usize) {
                 ei += 1;
                 continue;
             }
+            let vidx = (eid as usize) - m;
+            if vidx >= comp1.len() {
+                ei += 1;
+                continue;
+            }
 
-            let c1 = comp1.get(&eid).copied();
-            let c2 = comp2.get(&eid).copied();
+            let c1 = comp1[vidx];
+            let c2 = comp2[vidx];
             let j = match (c1, c2) {
-                (Some(a), Some(b)) if a == i && !visited[b] => b,
-                (Some(a), Some(b)) if b == i && !visited[a] => a,
+                (a, b) if a != INVALID_COMP && b != INVALID_COMP && a == i && !visited[b] => b,
+                (a, b) if a != INVALID_COMP && b != INVALID_COMP && b == i && !visited[a] => a,
                 _ => {
                     ei += 1;
                     continue;
@@ -2057,11 +2488,15 @@ fn merge_same_type_components(comps: &mut Vec<SplitComponent>, m: usize) {
 
             for e in &j_edges {
                 if (e.eid as usize) >= m {
-                    if comp1.get(&e.eid) == Some(&j) {
-                        comp1.insert(e.eid, i);
+                    let idx = (e.eid as usize) - m;
+                    if idx >= comp1.len() {
+                        continue;
                     }
-                    if comp2.get(&e.eid) == Some(&j) {
-                        comp2.insert(e.eid, i);
+                    if comp1[idx] == j {
+                        comp1[idx] = i;
+                    }
+                    if comp2[idx] == j {
+                        comp2[idx] = i;
                     }
                 }
             }
@@ -2078,11 +2513,10 @@ fn assemble_spqr_tree(graph: &Graph, components: &[SplitComponent], next_virtual
     let m = graph.num_edges();
     let base = m as u32;
 
-    // Use builder for flat construction
     let mut builder = SpqrTreeBuilder::new(m);
+    let component_types = classify_components_parallel(components);
 
-    for comp in components {
-        let nt = classify_component(comp);
+    for (comp, &nt) in components.iter().zip(component_types.iter()) {
         let mut lid: HashMap<u32, u32> = HashMap::new();
         let mut n2o: Vec<NodeId> = Vec::new();
         let mut local_of = |v: u32| -> u32 {
@@ -2118,7 +2552,6 @@ fn assemble_spqr_tree(graph: &Graph, components: &[SplitComponent], next_virtual
             });
         }
         let num_nodes = n2o.len() as u32;
-        // Strict assertion: verify all edge indices are within bounds
         for (i, e) in se.iter().enumerate() {
             assert!(
                 e.src.0 < num_nodes && e.dst.0 < num_nodes,
@@ -2138,7 +2571,6 @@ fn assemble_spqr_tree(graph: &Graph, components: &[SplitComponent], next_virtual
         return builder.finalize_empty();
     }
 
-    // Link virtual edges
     let num_virtual = next_virtual.saturating_sub(base) as usize;
     let mut first: Vec<Option<(usize, u32)>> = vec![None; num_virtual];
     let mut pairs: Vec<(usize, u32, usize, u32)> = Vec::new();
@@ -2162,7 +2594,6 @@ fn assemble_spqr_tree(graph: &Graph, components: &[SplitComponent], next_virtual
         }
     }
 
-    // Clear unpaired virtual edges
     for entry in &first {
         if let Some(&(ti, ei)) = entry.as_ref() {
             let edge = builder.skeleton_edge_mut(TreeNodeId(ti as u32), ei as usize);
@@ -2263,74 +2694,501 @@ fn assemble_spqr_tree(graph: &Graph, components: &[SplitComponent], next_virtual
     builder.finalize_with_children(root, children_offsets, children_flat)
 }
 
-impl SpqrTree {
-    pub fn normalize(&mut self) {
-        // For flat structure, normalize by rebuilding with merged same-type adjacent nodes
-        // This is O(n) time and space, same as original
+#[inline]
+fn mix64(state: u64, x: u64) -> u64 {
+    let mut h = state ^ x;
+    h = h.wrapping_mul(0x100000001b3);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc2b2ae3d27d4eb4f);
+    h ^= h >> 29;
+    h
+}
 
+impl SpqrTree {
+    pub fn canonicalize_skeleton_node_order(&mut self) {
+        let n = self.len();
+        if n == 0 {
+            return;
+        }
+        for tn in 0..n {
+            let nm_s = self.node_mapping_offsets[tn] as usize;
+            let nm_e = self.node_mapping_offsets[tn + 1] as usize;
+            let k = nm_e - nm_s;
+            if k <= 1 {
+                continue;
+            }
+            let mut perm: Vec<u32> = (0..k as u32).collect();
+            perm.sort_by_key(|&old_local| self.node_mapping[nm_s + old_local as usize].0);
+            let mut inv = vec![0u32; k];
+            for new_local in 0..k {
+                inv[perm[new_local] as usize] = new_local as u32;
+            }
+            if (0..k).all(|i| perm[i] == i as u32) {
+                continue;
+            }
+            let new_nm: Vec<crate::NodeId> = (0..k)
+                .map(|new_local| self.node_mapping[nm_s + perm[new_local] as usize])
+                .collect();
+            self.node_mapping[nm_s..(nm_s + k)].copy_from_slice(&new_nm[..k]);
+            let s = self.skeleton_offsets[tn] as usize;
+            let e = self.skeleton_offsets[tn + 1] as usize;
+            for i in s..e {
+                let edge = &mut self.skeleton_edges[i];
+                edge.src = crate::NodeId(inv[edge.src.0 as usize]);
+                edge.dst = crate::NodeId(inv[edge.dst.0 as usize]);
+            }
+        }
+    }
+
+    pub fn canonicalize_skeleton_edge_orientation(&mut self) {
+        for edge in &mut self.skeleton_edges {
+            if edge.src.0 > edge.dst.0 {
+                std::mem::swap(&mut edge.src, &mut edge.dst);
+            }
+        }
+    }
+
+    pub fn move_root_to_zero(&mut self) {
+        let n = self.len();
+        if n == 0 {
+            return;
+        }
+        let r = self.root.idx();
+        if r == 0 {
+            return;
+        }
+        self.node_types.swap(0, r);
+        self.skeleton_num_nodes.swap(0, r);
+        if self.min_real_per_node.len() == n {
+            self.min_real_per_node.swap(0, r);
+        }
+
+        let mut new_nm_offsets = vec![0u32; n + 1];
+        let mut new_nm: Vec<NodeId> = Vec::with_capacity(self.node_mapping.len());
+        let perm = |i: usize| -> usize {
+            if i == 0 {
+                r
+            } else if i == r {
+                0
+            } else {
+                i
+            }
+        };
+        for i in 0..n {
+            let src_i = perm(i);
+            let s = self.node_mapping_offsets[src_i] as usize;
+            let e = self.node_mapping_offsets[src_i + 1] as usize;
+            new_nm.extend_from_slice(&self.node_mapping[s..e]);
+            new_nm_offsets[i + 1] = new_nm.len() as u32;
+        }
+        self.node_mapping_offsets = new_nm_offsets;
+        self.node_mapping = new_nm;
+
+        let mut new_sk_offsets = vec![0u32; n + 1];
+        let mut new_sk: Vec<SkeletonEdge> = Vec::with_capacity(self.skeleton_edges.len());
+        for i in 0..n {
+            let src_i = perm(i);
+            let s = self.skeleton_offsets[src_i] as usize;
+            let e = self.skeleton_offsets[src_i + 1] as usize;
+            new_sk.extend_from_slice(&self.skeleton_edges[s..e]);
+            new_sk_offsets[i + 1] = new_sk.len() as u32;
+        }
+        self.skeleton_offsets = new_sk_offsets;
+        self.skeleton_edges = new_sk;
+
+        let mut new_ch_offsets = vec![0u32; n + 1];
+        let mut new_ch: Vec<TreeNodeId> = Vec::with_capacity(self.children.len());
+        for i in 0..n {
+            let src_i = perm(i);
+            let s = self.children_offsets[src_i] as usize;
+            let e = self.children_offsets[src_i + 1] as usize;
+            new_ch.extend_from_slice(&self.children[s..e]);
+            new_ch_offsets[i + 1] = new_ch.len() as u32;
+        }
+        self.children_offsets = new_ch_offsets;
+        self.children = new_ch;
+
+        self.node_parents.swap(0, r);
+        for p in &mut self.node_parents {
+            if !p.is_valid() {
+                continue;
+            }
+            let pi = p.idx();
+            if pi == 0 {
+                *p = TreeNodeId(r as u32);
+            } else if pi == r {
+                *p = TreeNodeId(0);
+            }
+        }
+
+        for c in &mut self.children {
+            if !c.is_valid() {
+                continue;
+            }
+            let ci = c.idx();
+            if ci == 0 {
+                *c = TreeNodeId(r as u32);
+            } else if ci == r {
+                *c = TreeNodeId(0);
+            }
+        }
+
+        for e in &mut self.skeleton_edges {
+            if !e.twin_tree_node.is_valid() {
+                continue;
+            }
+            let ti = e.twin_tree_node.idx();
+            if ti == 0 {
+                e.twin_tree_node = TreeNodeId(r as u32);
+            } else if ti == r {
+                e.twin_tree_node = TreeNodeId(0);
+            }
+        }
+
+        for tn in &mut self.edge_to_tree_node {
+            if !tn.is_valid() {
+                continue;
+            }
+            let ti = tn.idx();
+            if ti == 0 {
+                *tn = TreeNodeId(r as u32);
+            } else if ti == r {
+                *tn = TreeNodeId(0);
+            }
+        }
+
+        self.root = TreeNodeId(0);
+    }
+
+    pub fn recompute_min_real_per_node(&mut self) {
+        let n = self.len();
+        self.min_real_per_node = vec![u32::MAX; n];
+        for tn in 0..n {
+            let s = self.skeleton_offsets[tn] as usize;
+            let e = self.skeleton_offsets[tn + 1] as usize;
+            let mut local_min = u32::MAX;
+            for i in s..e {
+                let re = self.skeleton_edges[i].real_edge;
+                if re.is_valid() && re.0 < local_min {
+                    local_min = re.0;
+                }
+            }
+            self.min_real_per_node[tn] = local_min;
+        }
+    }
+
+    pub fn canonicalize_root(&mut self) {
+        if !CANONICALIZE_ROOT_ENABLED.load(Ordering::Relaxed) {
+            return;
+        }
         let n = self.len();
         if n == 0 {
             return;
         }
 
-        // Track which nodes are absorbed into others
-        let mut absorbed_into: Vec<Option<TreeNodeId>> = vec![None; n];
-        let mut changed = true;
+        let min_real: &[u32] = if self.min_real_per_node.len() == n {
+            &self.min_real_per_node
+        } else {
+            self.recompute_min_real_per_node();
+            &self.min_real_per_node
+        };
 
-        while changed {
-            changed = false;
+        let mut new_root = 0usize;
+        for tn in 1..n {
+            if min_real[tn] < min_real[new_root]
+                || (min_real[tn] == min_real[new_root] && tn < new_root)
+            {
+                new_root = tn;
+            }
+        }
 
-            for i in 0..n {
-                if absorbed_into[i].is_some() {
-                    continue;
-                }
-                let num_edges = self.skeleton_offsets[i + 1] - self.skeleton_offsets[i];
-                if num_edges == 0 {
-                    continue;
-                }
+        let new_root_id = TreeNodeId(new_root as u32);
+        if self.root == new_root_id {
+            return;
+        }
 
-                let t = self.node_types[i];
-                if t != SpqrNodeType::S && t != SpqrNodeType::P {
-                    continue;
-                }
+        let mut adj_count = vec![0u32; n];
+        for tn in 0..n {
+            let p = self.node_parents[tn];
+            if p.is_valid() && (p.idx()) != tn {
+                adj_count[tn] += 1;
+                adj_count[p.idx()] += 1;
+            }
+        }
+        let mut adj_off = vec![0u32; n + 1];
+        for i in 0..n {
+            adj_off[i + 1] = adj_off[i] + adj_count[i];
+        }
+        let total = adj_off[n] as usize;
+        let mut adj_flat = vec![TreeNodeId::INVALID; total];
+        let mut cursor = adj_off[..n].to_vec();
+        for tn in 0..n {
+            let p = self.node_parents[tn];
+            if p.is_valid() && (p.idx()) != tn {
+                adj_flat[cursor[tn] as usize] = p;
+                cursor[tn] += 1;
+                adj_flat[cursor[p.idx()] as usize] = TreeNodeId(tn as u32);
+                cursor[p.idx()] += 1;
+            }
+        }
 
-                // Check children for same-type nodes to merge
-                let children_start = self.children_offsets[i] as usize;
-                let children_end = self.children_offsets[i + 1] as usize;
-
-                for ci in children_start..children_end {
-                    let child = self.children[ci];
-                    if !child.is_valid() || absorbed_into[child.idx()].is_some() {
-                        continue;
-                    }
-
-                    let child_num_edges =
-                        self.skeleton_offsets[child.idx() + 1] - self.skeleton_offsets[child.idx()];
-                    if child_num_edges == 0 {
-                        continue;
-                    }
-
-                    if self.node_types[child.idx()] == t {
-                        absorbed_into[child.idx()] = Some(TreeNodeId(i as u32));
-                        changed = true;
-                    }
+        let mut new_parents: Vec<TreeNodeId> = vec![TreeNodeId::INVALID; n];
+        let mut visited = vec![false; n];
+        let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+        queue.push_back(new_root);
+        visited[new_root] = true;
+        while let Some(v) = queue.pop_front() {
+            let s = adj_off[v] as usize;
+            let e = adj_off[v + 1] as usize;
+            for i in s..e {
+                let u = adj_flat[i];
+                if u.is_valid() && !visited[u.idx()] {
+                    visited[u.idx()] = true;
+                    new_parents[u.idx()] = TreeNodeId(v as u32);
+                    queue.push_back(u.idx());
                 }
             }
         }
 
-        // If nothing was absorbed, we're done
-        if absorbed_into.iter().all(|x| x.is_none()) {
+        self.root = new_root_id;
+        self.node_parents = new_parents;
+
+        let mut child_count = vec![0u32; n];
+        for tn in 0..n {
+            let p = self.node_parents[tn];
+            if p.is_valid() {
+                child_count[p.idx()] += 1;
+            }
+        }
+        let mut new_offsets = vec![0u32; n + 1];
+        for i in 0..n {
+            new_offsets[i + 1] = new_offsets[i] + child_count[i];
+        }
+        let total_children = new_offsets[n] as usize;
+        let mut new_children = vec![TreeNodeId::INVALID; total_children];
+        let mut write = new_offsets[..n].to_vec();
+        for tn in 0..n {
+            let p = self.node_parents[tn];
+            if p.is_valid() {
+                new_children[write[p.idx()] as usize] = TreeNodeId(tn as u32);
+                write[p.idx()] += 1;
+            }
+        }
+        self.children_offsets = new_offsets;
+        self.children = new_children;
+
+        self.canonicalize_skeleton_edge_order();
+    }
+
+    fn canonicalize_skeleton_edge_order(&mut self) {
+        let n = self.len();
+        if n == 0 {
             return;
         }
 
-        // Rebuild the tree with merged nodes
+        for _iter in 0..32 {
+            let hashes = self.compute_canonical_hashes();
+
+            let mut any_change = false;
+            for tn in 0..n {
+                let s = self.skeleton_offsets[tn] as usize;
+                let e = self.skeleton_offsets[tn + 1] as usize;
+                let k = e - s;
+                if k <= 1 {
+                    continue;
+                }
+
+                #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+                struct Key {
+                    is_virtual: u8,
+                    a: u64,
+                    b: u32,
+                }
+                let mut keyed: Vec<(u32, Key)> = (0..k as u32)
+                    .map(|i| {
+                        let edge = &self.skeleton_edges[s + i as usize];
+                        let key = if edge.real_edge.is_valid() {
+                            Key {
+                                is_virtual: 0,
+                                a: edge.real_edge.0 as u64,
+                                b: 0,
+                            }
+                        } else {
+                            Key {
+                                is_virtual: 1,
+                                a: hashes[edge.twin_tree_node.idx()],
+                                b: edge.twin_edge_idx,
+                            }
+                        };
+                        (i, key)
+                    })
+                    .collect();
+                keyed.sort_by_key(|(_, k)| *k);
+
+                let mut new_pos = vec![0u32; k];
+                for (new_idx, (old_idx, _)) in keyed.iter().enumerate() {
+                    new_pos[*old_idx as usize] = new_idx as u32;
+                }
+                let is_identity = (0..k).all(|i| new_pos[i] == i as u32);
+                if is_identity {
+                    continue;
+                }
+                any_change = true;
+
+                let new_edges: Vec<crate::SkeletonEdge> = keyed
+                    .iter()
+                    .map(|(old_idx, _)| self.skeleton_edges[s + *old_idx as usize])
+                    .collect();
+                self.skeleton_edges[s..(s + k)].copy_from_slice(&new_edges[..k]);
+
+                for new_idx in 0..k {
+                    let edge = self.skeleton_edges[s + new_idx];
+                    if !edge.real_edge.is_valid() {
+                        let twin_tn = edge.twin_tree_node.idx();
+                        let twin_idx = edge.twin_edge_idx as usize;
+                        let twin_so = self.skeleton_offsets[twin_tn] as usize;
+                        self.skeleton_edges[twin_so + twin_idx].twin_edge_idx = new_idx as u32;
+                    }
+                }
+            }
+            if !any_change {
+                break;
+            }
+        }
+    }
+
+    fn compute_canonical_hashes(&self) -> Vec<u64> {
+        let n = self.len();
+        let mut hashes: Vec<u64> = vec![0u64; n];
+
+        for tn in 0..n {
+            let s = self.skeleton_offsets[tn] as usize;
+            let e = self.skeleton_offsets[tn + 1] as usize;
+            let mut real_eids: Vec<u32> = Vec::new();
+            let mut n_virt: u32 = 0;
+            for i in s..e {
+                let ed = &self.skeleton_edges[i];
+                if ed.real_edge.is_valid() {
+                    real_eids.push(ed.real_edge.0);
+                } else {
+                    n_virt += 1;
+                }
+            }
+            real_eids.sort();
+            let mut h: u64 = 0xcbf29ce484222325;
+            let ty_byte = match self.node_types[tn] {
+                crate::SpqrNodeType::S => 0u8,
+                crate::SpqrNodeType::P => 1,
+                crate::SpqrNodeType::R => 2,
+            };
+            h = mix64(h, ty_byte as u64);
+            h = mix64(h, n_virt as u64);
+            for r in &real_eids {
+                h = mix64(h, *r as u64);
+            }
+            hashes[tn] = h;
+        }
+
+        for _iter in 0..16 {
+            let mut new_hashes = hashes.clone();
+            for tn in 0..n {
+                let s = self.skeleton_offsets[tn] as usize;
+                let e = self.skeleton_offsets[tn + 1] as usize;
+                let mut neigh_hashes: Vec<u64> = Vec::new();
+                for i in s..e {
+                    let ed = &self.skeleton_edges[i];
+                    if !ed.real_edge.is_valid() {
+                        neigh_hashes.push(hashes[ed.twin_tree_node.idx()]);
+                    }
+                }
+                neigh_hashes.sort();
+                let mut h = hashes[tn];
+                for nh in &neigh_hashes {
+                    h = mix64(h, *nh);
+                }
+                new_hashes[tn] = h;
+            }
+            if new_hashes == hashes {
+                break;
+            }
+            hashes = new_hashes;
+        }
+        hashes
+    }
+
+    pub fn normalize(&mut self) {
+        let n = self.len();
+        if n == 0 {
+            return;
+        }
+
+        let mut parent_set: Vec<u32> = (0..n as u32).collect();
+
+        fn find(p: &mut [u32], x: u32) -> u32 {
+            let mut r = x;
+            while p[r as usize] != r {
+                r = p[r as usize];
+            }
+            let mut cur = x;
+            while p[cur as usize] != r {
+                let next = p[cur as usize];
+                p[cur as usize] = r;
+                cur = next;
+            }
+            r
+        }
+
+        for i in 0..n {
+            let p_id = self.node_parents[i];
+            if !p_id.is_valid() || p_id.idx() == i {
+                continue;
+            }
+            let pi = p_id.idx();
+
+            let t = self.node_types[i];
+            if t != SpqrNodeType::S && t != SpqrNodeType::P {
+                continue;
+            }
+            if self.node_types[pi] != t {
+                continue;
+            }
+
+            let i_num = self.skeleton_offsets[i + 1] - self.skeleton_offsets[i];
+            if i_num == 0 {
+                continue;
+            }
+            let p_num = self.skeleton_offsets[pi + 1] - self.skeleton_offsets[pi];
+            if p_num == 0 {
+                continue;
+            }
+
+            let r_x = find(&mut parent_set, i as u32);
+            let r_p = find(&mut parent_set, pi as u32);
+            if r_x != r_p {
+                parent_set[r_x as usize] = r_p;
+            }
+        }
+
+        let mut absorbed_into: Vec<Option<TreeNodeId>> = vec![None; n];
+        let mut any_absorbed = false;
+        for i in 0..n {
+            let r = find(&mut parent_set, i as u32) as usize;
+            if r != i {
+                absorbed_into[i] = Some(TreeNodeId(r as u32));
+                any_absorbed = true;
+            }
+        }
+
+        if !any_absorbed {
+            return;
+        }
+
         self.rebuild_with_merges(&absorbed_into);
     }
 
     fn rebuild_with_merges(&mut self, absorbed_into: &[Option<TreeNodeId>]) {
         let n = self.len();
 
-        // Build mapping from old tree node ID to new tree node ID
         let mut old_to_new: Vec<TreeNodeId> = vec![TreeNodeId::INVALID; n];
         let mut new_idx = 0u32;
         for i in 0..n {
@@ -2340,7 +3198,6 @@ impl SpqrTree {
             }
         }
 
-        // For absorbed nodes, map to the node they were absorbed into
         for i in 0..n {
             if let Some(parent) = absorbed_into[i] {
                 old_to_new[i] = old_to_new[parent.idx()];
@@ -2349,17 +3206,12 @@ impl SpqrTree {
 
         let new_count = new_idx as usize;
         if new_count == n {
-            return; // Nothing absorbed
+            return;
         }
-
-        // ===== BUILD UNIFIED LOCAL NODE MAPPINGS =====
-        // For each new tree node, build a mapping: original_node_id -> new_local_index
-        // This handles merging of skeletons by identifying nodes via their original IDs
 
         let mut new_local_maps: Vec<std::collections::HashMap<u32, u32>> =
             vec![std::collections::HashMap::new(); new_count];
 
-        // First pass: collect all original nodes for each new tree node
         for i in 0..n {
             let new_i = old_to_new[i].idx();
             let map_start = self.node_mapping_offsets[i] as usize;
@@ -2367,14 +3219,11 @@ impl SpqrTree {
 
             for local_idx in 0..(map_end - map_start) {
                 let orig_node = self.node_mapping[map_start + local_idx].0;
-                // Insert if not already present (first occurrence gets the index)
                 let next_idx = new_local_maps[new_i].len() as u32;
                 new_local_maps[new_i].entry(orig_node).or_insert(next_idx);
             }
         }
 
-        // Build reverse mapping: for each old tree node, map old_local -> new_local
-        // old_local -> original -> new_local
         let mut local_remaps: Vec<Vec<u32>> = Vec::with_capacity(n);
         for i in 0..n {
             let new_i = old_to_new[i].idx();
@@ -2390,14 +3239,12 @@ impl SpqrTree {
             local_remaps.push(remap);
         }
 
-        // ===== PASS 1: Count sizes for each new node =====
         let mut edge_counts: Vec<u32> = vec![0; new_count];
         let mut child_counts: Vec<u32> = vec![0; new_count];
 
         for i in 0..n {
             let new_i = old_to_new[i].idx();
 
-            // Count edges (excluding virtual edges to merged nodes)
             let edge_start = self.skeleton_offsets[i] as usize;
             let edge_end = self.skeleton_offsets[i + 1] as usize;
             for ei in edge_start..edge_end {
@@ -2405,13 +3252,12 @@ impl SpqrTree {
                 if e.twin_tree_node.is_valid() {
                     let twin_new = old_to_new[e.twin_tree_node.idx()];
                     if twin_new == TreeNodeId(new_i as u32) {
-                        continue; // Skip - virtual edge to merged node
+                        continue;
                     }
                 }
                 edge_counts[new_i] += 1;
             }
 
-            // Count direct children (only for non-absorbed nodes)
             if absorbed_into[i].is_none() {
                 let cs = self.children_offsets[i] as usize;
                 let ce = self.children_offsets[i + 1] as usize;
@@ -2424,7 +3270,6 @@ impl SpqrTree {
             }
         }
 
-        // Count children from absorbed nodes
         for j in 0..n {
             if let Some(parent_tid) = absorbed_into[j] {
                 let new_i = old_to_new[parent_tid.idx()].idx();
@@ -2461,19 +3306,41 @@ impl SpqrTree {
         let mut new_node_types: Vec<SpqrNodeType> = vec![SpqrNodeType::R; new_count];
         let mut new_node_parents: Vec<TreeNodeId> = vec![TreeNodeId::INVALID; new_count];
         let mut new_skeleton_num_nodes: Vec<u32> = vec![0; new_count];
+
         let mut new_skeleton_edges: Vec<SkeletonEdge> = vec![SkeletonEdge::default(); total_edges];
         let mut new_children: Vec<TreeNodeId> = vec![TreeNodeId::INVALID; total_children];
         let mut new_node_mapping: Vec<NodeId> = vec![NodeId::INVALID; total_mapping];
 
-        // Track write positions
         let mut edge_write_pos: Vec<u32> = new_skeleton_offsets[..new_count].to_vec();
         let mut child_write_pos: Vec<u32> = new_children_offsets[..new_count].to_vec();
+
+        let mut old_to_new_edge_idx: std::collections::HashMap<(u32, u32), u32> =
+            std::collections::HashMap::new();
+        {
+            let mut counters: Vec<u32> = vec![0u32; new_count];
+            for i in 0..n {
+                let new_i = old_to_new[i].idx();
+                let edge_start = self.skeleton_offsets[i] as usize;
+                let edge_end = self.skeleton_offsets[i + 1] as usize;
+                for ei in edge_start..edge_end {
+                    let e = &self.skeleton_edges[ei];
+                    if e.twin_tree_node.is_valid() {
+                        let twin_new = old_to_new[e.twin_tree_node.idx()];
+                        if twin_new == TreeNodeId(new_i as u32) {
+                            continue;
+                        }
+                    }
+                    old_to_new_edge_idx
+                        .insert((i as u32, (ei - edge_start) as u32), counters[new_i]);
+                    counters[new_i] += 1;
+                }
+            }
+        }
 
         for new_i in 0..new_count {
             let map = &new_local_maps[new_i];
             let map_start = new_mapping_offsets[new_i] as usize;
 
-            // Sort by new local index to maintain order
             let mut entries: Vec<_> = map.iter().collect();
             entries.sort_by_key(|(_, &idx)| idx);
 
@@ -2484,7 +3351,6 @@ impl SpqrTree {
             new_skeleton_num_nodes[new_i] = map.len() as u32;
         }
 
-        // Fill node info from non-absorbed nodes
         for i in 0..n {
             if absorbed_into[i].is_some() {
                 continue;
@@ -2492,7 +3358,6 @@ impl SpqrTree {
 
             let new_i = old_to_new[i].idx();
 
-            // Node info
             new_node_types[new_i] = self.node_types[i];
             let parent = self.node_parents[i];
             new_node_parents[new_i] = if parent.is_valid() {
@@ -2501,7 +3366,6 @@ impl SpqrTree {
                 TreeNodeId::INVALID
             };
 
-            // Copy direct children
             let cs = self.children_offsets[i] as usize;
             let ce = self.children_offsets[i + 1] as usize;
             for ci in cs..ce {
@@ -2514,7 +3378,6 @@ impl SpqrTree {
             }
         }
 
-        // Copy children from absorbed nodes
         for j in 0..n {
             if let Some(parent_tid) = absorbed_into[j] {
                 let new_i = old_to_new[parent_tid.idx()].idx();
@@ -2543,12 +3406,18 @@ impl SpqrTree {
                 if e.twin_tree_node.is_valid() {
                     let twin_new = old_to_new[e.twin_tree_node.idx()];
                     if twin_new == TreeNodeId(new_i as u32) {
-                        continue; // Skip merged virtual edge
+                        continue;
                     }
                     e.twin_tree_node = twin_new;
+
+                    let twin_old_tid = self.skeleton_edges[ei].twin_tree_node.0;
+                    let twin_old_eidx = self.skeleton_edges[ei].twin_edge_idx;
+                    if let Some(&new_eidx) = old_to_new_edge_idx.get(&(twin_old_tid, twin_old_eidx))
+                    {
+                        e.twin_edge_idx = new_eidx;
+                    }
                 }
 
-                // REMAP src and dst to new local indices
                 let old_src = e.src.0 as usize;
                 let old_dst = e.dst.0 as usize;
                 if old_src < remap.len() && old_dst < remap.len() {
@@ -2562,19 +3431,16 @@ impl SpqrTree {
             }
         }
 
-        // Update edge_to_tree_node
         for tn in &mut self.edge_to_tree_node {
             if tn.is_valid() {
                 *tn = old_to_new[tn.idx()];
             }
         }
 
-        // Update root
         if self.root.is_valid() {
             self.root = old_to_new[self.root.idx()];
         }
 
-        // Replace arrays
         self.node_types = new_node_types;
         self.node_parents = new_node_parents;
         self.skeleton_offsets = new_skeleton_offsets;
@@ -2584,6 +3450,8 @@ impl SpqrTree {
         self.skeleton_num_nodes = new_skeleton_num_nodes;
         self.children_offsets = new_children_offsets;
         self.children = new_children;
+
+        self.recompute_min_real_per_node();
     }
 
     pub fn compact(&mut self) {
@@ -2592,14 +3460,12 @@ impl SpqrTree {
             return;
         }
 
-        // Find nodes with edges (non-empty)
         let mut is_alive: Vec<bool> = vec![false; n];
         for i in 0..n {
             let num_edges = self.skeleton_offsets[i + 1] - self.skeleton_offsets[i];
             is_alive[i] = num_edges > 0;
         }
 
-        // Build mapping from old to new IDs
         let mut old_to_new: Vec<TreeNodeId> = vec![TreeNodeId::INVALID; n];
         let mut new_idx = 0u32;
         for i in 0..n {
@@ -2610,13 +3476,11 @@ impl SpqrTree {
         }
 
         if new_idx as usize == n {
-            // No compaction needed
             return;
         }
 
         let new_count = new_idx as usize;
 
-        // Build new arrays
         let mut new_node_types: Vec<SpqrNodeType> = Vec::with_capacity(new_count);
         let mut new_node_parents: Vec<TreeNodeId> = Vec::with_capacity(new_count);
         let mut new_skeleton_num_nodes: Vec<u32> = Vec::with_capacity(new_count);
@@ -2643,7 +3507,6 @@ impl SpqrTree {
 
             new_skeleton_num_nodes.push(self.skeleton_num_nodes[i]);
 
-            // Copy skeleton edges, updating twin references
             let edge_start = self.skeleton_offsets[i] as usize;
             let edge_end = self.skeleton_offsets[i + 1] as usize;
             for ei in edge_start..edge_end {
@@ -2655,13 +3518,11 @@ impl SpqrTree {
             }
             new_skeleton_offsets.push(new_skeleton_edges.len() as u32);
 
-            // Copy node mapping
             let map_start = self.node_mapping_offsets[i] as usize;
             let map_end = self.node_mapping_offsets[i + 1] as usize;
             new_node_mapping.extend_from_slice(&self.node_mapping[map_start..map_end]);
             new_node_mapping_offsets.push(new_node_mapping.len() as u32);
 
-            // Copy children, filtering out dead nodes
             let children_start = self.children_offsets[i] as usize;
             let children_end = self.children_offsets[i + 1] as usize;
             for ci in children_start..children_end {
@@ -2673,7 +3534,6 @@ impl SpqrTree {
             new_children_offsets.push(new_children.len() as u32);
         }
 
-        // Update edge_to_tree_node
         for tn in &mut self.edge_to_tree_node {
             if tn.is_valid() && old_to_new[tn.idx()].is_valid() {
                 *tn = old_to_new[tn.idx()];
@@ -2682,12 +3542,10 @@ impl SpqrTree {
             }
         }
 
-        // Update root
         if self.root.is_valid() {
             self.root = old_to_new[self.root.idx()];
         }
 
-        // Replace arrays
         self.node_types = new_node_types;
         self.node_parents = new_node_parents;
         self.skeleton_num_nodes = new_skeleton_num_nodes;
