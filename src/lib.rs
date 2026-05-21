@@ -243,6 +243,31 @@ impl Graph {
     pub fn add_nodes_fast(&mut self, n: usize) {
         self.heads.resize(self.heads.len() + n, INVALID);
     }
+    pub fn add_edges_flat(&mut self, pairs: &[u32]) {
+        let num_edges = pairs.len() / 2;
+        self.edges.reserve(num_edges);
+        self.half_edges.reserve(num_edges * 2);
+        for i in 0..num_edges {
+            let u = NodeId(pairs[i * 2]);
+            let v = NodeId(pairs[i * 2 + 1]);
+            let eid = EdgeId(self.edges.len() as u32);
+            self.edges.push(Edge { src: u, dst: v });
+            let idx_uv = self.half_edges.len() as u32;
+            let idx_vu = idx_uv + 1;
+            self.half_edges.push(HalfEdge {
+                target: v,
+                edge_id: eid,
+                next: self.heads[u.idx()],
+            });
+            self.heads[u.idx()] = idx_uv;
+            self.half_edges.push(HalfEdge {
+                target: u,
+                edge_id: eid,
+                next: self.heads[v.idx()],
+            });
+            self.heads[v.idx()] = idx_vu;
+        }
+    }
     #[inline]
     pub fn num_nodes(&self) -> usize {
         self.heads.len()

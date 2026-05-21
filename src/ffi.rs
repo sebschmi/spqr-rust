@@ -58,7 +58,7 @@ pub unsafe extern "C" fn spqr_graph_free(graph: *mut Graph) {
 pub unsafe extern "C" fn spqr_graph_add_nodes(graph: *mut Graph, count: u32) -> u32 {
     let graph = &mut *graph;
     let first = graph.num_nodes() as u32;
-    graph.add_nodes(count as usize);
+    graph.add_nodes_fast(count as usize);
     first
 }
 
@@ -75,9 +75,7 @@ pub unsafe extern "C" fn spqr_graph_add_edges_batch(
 ) {
     let graph = &mut *graph;
     let pairs = slice::from_raw_parts(edges, (count * 2) as usize);
-    for i in 0..count as usize {
-        graph.add_edge(NodeId(pairs[i * 2]), NodeId(pairs[i * 2 + 1]));
-    }
+    graph.add_edges_flat(pairs);
 }
 
 #[no_mangle]

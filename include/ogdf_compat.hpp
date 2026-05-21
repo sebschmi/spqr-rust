@@ -265,7 +265,13 @@ public:
     Graph() : g_(std::make_unique<spqr_rust::RustGraph>()), nodes{this}, edges{this} {}
     
     node newNode() { return node{g_->addNode()}; }
+    node newNodes(uint32_t count) { return node{g_->addNodes(count)}; }
     edge newEdge(node u, node v) { return edge{g_->addEdge(u.idx, v.idx)}; }
+    edge newEdgesBatchFlat(const uint32_t* endpoints, uint32_t count) {
+        uint32_t first = g_->numEdges();
+        g_->addEdgesBatchFlat(endpoints, count);
+        return edge{first};
+    }
 
     void delEdge(edge e) {
         const uint32_t rawN = g_->numEdges();
