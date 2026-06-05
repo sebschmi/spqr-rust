@@ -5,30 +5,44 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::env;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
-        eprintln!("Usage: {} <graph_file>", args[0]);
+        eprintln!("Usage: {} <graph_file|gfa_file>", args[0]);
         eprintln!("Graph file format: lines of 'node1 node2' (names or 0-indexed numbers)");
+        eprintln!("GFA file format: GFA version 1");
         std::process::exit(1);
     }
 
     let filename = &args[1];
     let file = File::open(filename).expect("Cannot open file");
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
 
     let mut nodes: HashMap<String, u32> = HashMap::new();
     let mut next_id: u32 = 0;
     let mut edges: Vec<(u32, u32)> = Vec::new();
+    let mut is_first_content_line = true;
+    let mut is_gfa_format = false;
 
-    for line in reader.lines() {
+    for line in reader.by_ref().lines() {
         let line = line.expect("IO error");
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
+        }
+
+        if is_first_content_line {
+            if line.starts_with("H") {
+                println!("Detected GFAv1 format");
+                is_gfa_format = true;
+                break;
+            } else {
+                println!("Detected simple edge list format");
+            }
+            is_first_content_line = false;
         }
 
         let parts: Vec<&str> = line.split_whitespace().collect();
@@ -52,6 +66,58 @@ fn main() {
         });
 
         edges.push((u, v));
+    }
+
+    if is_gfa_format {
+        // Parse file as GFA.
+        // Header line was read already, so it is enough to continue reading only nodes and edges (segments and links).
+
+        for line in reader.by_ref().lines() {
+            let line = line.expect("IO error");
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 2 {
+                continue;
+            }
+
+            match parts[0] {
+                "S" => {
+                    // Segment line: S <name> <sequence>
+                    // We only care about the name, which is the second field.
+                    let name = parts[1].to_string();
+                    nodes.entry(name).or_insert_with(|| {
+                        let id = next_id;
+                        next_id += 1;
+                        id
+                    });
+                }
+                "L" => {
+                    // Link line: L <from> <from_orient> <to> <to_orient> <overlap>
+                    // We care about the from and to fields, which are the second and fourth fields.
+                    let from = parts[1].to_string();
+                    let to = parts[3].to_string();
+                    let u = *nodes.entry(from).or_insert_with(|| {
+                        let id = next_id;
+                        next_id += 1;
+                        id
+                    });
+                    let v = *nodes.entry(to).or_insert_with(|| {
+                        let id = next_id;
+                        next_id += 1;
+                        id
+                    });
+                    edges.push((u, v));
+                }
+                _ => {
+                    // Ignore other lines (e.g. header, paths).
+                    continue;
+                }
+            }
+        }
     }
 
     let n = next_id as usize;
