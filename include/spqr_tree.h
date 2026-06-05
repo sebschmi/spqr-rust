@@ -247,7 +247,7 @@ void spqr_tree_node_mapping_raw(const SpqrTree* tree,
 
 const uint32_t* spqr_tree_skeleton_num_nodes_raw(const SpqrTree* tree);
 
-char* spqr_format_to_string(const SpqrGraphFFI* graph, const SpqrResult* result);
+char* spqr_format_to_string(const SpqrGraphFFI* graph, const SpqrResult* result, size_t component_id, bool write_header);
 void spqr_string_free(char* s);
 
 #ifdef __cplusplus

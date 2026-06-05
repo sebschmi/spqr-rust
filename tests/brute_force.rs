@@ -417,7 +417,7 @@ fn check_spqr_format(g: &Graph, label: &str) {
     use spqr_rust::spqr_format::{parse_spqr_format, to_spqr_string, validate_spqr_format};
 
     let res = spqr_rust::build_spqr(g);
-    let s = to_spqr_string(g, &res, 0);
+    let s = to_spqr_string(g, &res, 0, true);
     let parsed = parse_spqr_format(&s)
         .unwrap_or_else(|e| panic!("[{}] Failed to parse .spqr format: {}\n\n{}", label, e, s));
     if let Err(errors) = validate_spqr_format(&parsed, g, &res) {

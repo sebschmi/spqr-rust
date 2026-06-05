@@ -723,9 +723,10 @@ pub unsafe extern "C" fn spqr_format_to_string(
     graph: *const Graph,
     result: *const SpqrResult,
     component_id: usize,
+    write_header: bool,
 ) -> *mut c_char {
     let mut buffer = Cursor::new(Vec::new());
-    if write_spqr_format(&mut buffer, &*graph, &*result, component_id).is_err() {
+    if write_spqr_format(&mut buffer, &*graph, &*result, component_id, write_header).is_err() {
         return ptr::null_mut();
     }
     let mut bytes = buffer.into_inner();

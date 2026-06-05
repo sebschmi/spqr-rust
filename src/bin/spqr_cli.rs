@@ -1,11 +1,12 @@
 //! SPQR tree computation
 
+use spqr_rust::spqr_format::{component_name, node_name};
 use spqr_rust::{build_spqr, Graph, NodeId};
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::env;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -216,8 +217,40 @@ fn main() {
 
         if spqr.len() <= 20 {
             println!("\nTree structure:");
-            let output = spqr_rust::spqr_format::to_spqr_string(&subgraph, &result, component_id);
+            let output = spqr_rust::spqr_format::to_spqr_string(
+                &subgraph,
+                &result,
+                component_id,
+                component_id == 0,
+            );
             println!("{}", output);
+        }
+    }
+
+    if let Some(output_file) = args.get(2) {
+        println!("Writing SPQR tree to {}", output_file);
+        let mut file = File::create(output_file).expect("Cannot create output file");
+
+        for (component_id, comp) in components.iter().enumerate() {
+            if comp.len() >= 2 {
+                let result = build_spqr(&graph);
+                spqr_rust::spqr_format::write_spqr_format(
+                    &mut file,
+                    &graph,
+                    &result,
+                    component_id,
+                    component_id == 0,
+                )
+                .expect("Failed to write SPQR format");
+            } else {
+                writeln!(
+                    &mut file,
+                    "G {} {}",
+                    component_name(component_id),
+                    node_name(NodeId(comp[0]))
+                )
+                .expect("IO error");
+            }
         }
     }
 }
