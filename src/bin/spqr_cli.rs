@@ -1,12 +1,13 @@
 //! SPQR tree computation
 
+use flate2::read::GzDecoder;
 use spqr_rust::spqr_format::{component_name, node_name};
 use spqr_rust::{build_spqr, Graph, NodeId};
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::env;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -23,7 +24,12 @@ fn main() {
 
     let filename = &args[1];
     let file = File::open(filename).expect("Cannot open file");
-    let mut reader = BufReader::new(file);
+    let mut reader: BufReader<Box<dyn Read>> = if filename.ends_with(".gz") {
+        let decoder = GzDecoder::new(file);
+        BufReader::new(Box::new(decoder))
+    } else {
+        BufReader::new(Box::new(file))
+    };
 
     let mut nodes: HashMap<String, u32> = HashMap::new();
     let mut next_id: u32 = 0;
@@ -229,13 +235,19 @@ fn main() {
 
     if let Some(output_file) = args.get(2) {
         println!("Writing SPQR tree to {}", output_file);
-        let mut file = File::create(output_file).expect("Cannot create output file");
+        let file = File::create(output_file).expect("Cannot create output file");
+        let mut writer: BufWriter<Box<dyn Write>> = if output_file.ends_with(".gz") {
+            let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+            BufWriter::new(Box::new(encoder))
+        } else {
+            BufWriter::new(Box::new(file))
+        };
 
         for (component_id, comp) in components.iter().enumerate() {
             if comp.len() >= 2 {
                 let result = build_spqr(&graph);
                 spqr_rust::spqr_format::write_spqr_format(
-                    &mut file,
+                    &mut writer,
                     &graph,
                     &result,
                     component_id,
@@ -244,7 +256,7 @@ fn main() {
                 .expect("Failed to write SPQR format");
             } else {
                 writeln!(
-                    &mut file,
+                    &mut writer,
                     "G {} {}",
                     component_name(component_id),
                     node_name(NodeId(comp[0]))

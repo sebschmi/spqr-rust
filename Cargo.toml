@@ -28,3 +28,5 @@ path = "src/bin/spqr_cli.rs"
 rand = "0.8.5"
 
 [dependencies]
+# Reading and writing compressed files
+flate2 = "1.1.9"
