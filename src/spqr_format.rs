@@ -35,27 +35,31 @@ pub fn write_spqr_format<W: Write>(
     w: &mut W,
     graph: &Graph,
     result: &SpqrResult,
+    component_id: usize,
 ) -> io::Result<()> {
-    write_spqr_format_inner(w, graph, &result.tree, &result.self_loops)
+    write_spqr_format_inner(w, graph, &result.tree, component_id, &result.self_loops)
 }
 
 pub fn write_spqr_tree_format<W: Write>(
     w: &mut W,
     graph: &Graph,
     tree: &SpqrTree,
+    component_id: usize,
 ) -> io::Result<()> {
-    write_spqr_format_inner(w, graph, tree, &[])
+    write_spqr_format_inner(w, graph, tree, component_id, &[])
 }
 
-pub fn to_spqr_string(graph: &Graph, result: &SpqrResult) -> String {
+pub fn to_spqr_string(graph: &Graph, result: &SpqrResult, component_id: usize) -> String {
     let mut buf = Vec::new();
-    write_spqr_format(&mut buf, graph, result).expect("write to Vec<u8> should not fail");
+    write_spqr_format(&mut buf, graph, result, component_id)
+        .expect("write to Vec<u8> should not fail");
     String::from_utf8(buf).expect("output is valid UTF-8")
 }
 
-pub fn tree_to_spqr_string(graph: &Graph, tree: &SpqrTree) -> String {
+pub fn tree_to_spqr_string(graph: &Graph, tree: &SpqrTree, component_id: usize) -> String {
     let mut buf = Vec::new();
-    write_spqr_tree_format(&mut buf, graph, tree).expect("write to Vec<u8> should not fail");
+    write_spqr_tree_format(&mut buf, graph, tree, component_id)
+        .expect("write to Vec<u8> should not fail");
     String::from_utf8(buf).expect("output is valid UTF-8")
 }
 
@@ -63,6 +67,7 @@ fn write_spqr_format_inner<W: Write>(
     w: &mut W,
     graph: &Graph,
     tree: &SpqrTree,
+    component_id: usize,
     self_loops: &[EdgeId],
 ) -> io::Result<()> {
     let n = graph.num_nodes();
@@ -71,7 +76,7 @@ fn write_spqr_format_inner<W: Write>(
     writeln!(w, "H {} {}", FORMAT_VERSION, FORMAT_URL)?;
     writeln!(w)?;
 
-    let comp = component_name(0);
+    let comp = component_name(component_id);
     write!(w, "G {}", comp)?;
     for v in 0..n {
         write!(w, " {}", node_name(NodeId(v as u32)))?;
@@ -203,11 +208,12 @@ fn write_spqr_format_inner<W: Write>(
 pub struct SpqrFormatDisplay<'a> {
     pub graph: &'a Graph,
     pub result: &'a SpqrResult,
+    pub component_id: usize,
 }
 
 impl<'a> fmt::Display for SpqrFormatDisplay<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&to_spqr_string(self.graph, self.result))
+        f.write_str(&to_spqr_string(self.graph, self.result, self.component_id))
     }
 }
 
@@ -537,7 +543,7 @@ mod tests {
     fn test_k4_format() {
         let g = make_k4();
         let res = build_spqr(&g);
-        let s = to_spqr_string(&g, &res);
+        let s = to_spqr_string(&g, &res, 0);
         println!(" K4 \n{}", s);
         assert!(s.starts_with("H v0.4"));
         assert!(s.contains("G G0 N0 N1 N2 N3"));
@@ -552,7 +558,7 @@ mod tests {
     fn test_cycle_format() {
         let g = make_cycle(5);
         let res = build_spqr(&g);
-        let s = to_spqr_string(&g, &res);
+        let s = to_spqr_string(&g, &res, 0);
         println!(" Cycle 5 \n{}", s);
         assert!(s.starts_with("H v0.4"));
         assert!(s.contains("S S0 B0"));
@@ -562,7 +568,7 @@ mod tests {
     fn test_bond_format() {
         let g = make_bond();
         let res = build_spqr(&g);
-        let s = to_spqr_string(&g, &res);
+        let s = to_spqr_string(&g, &res, 0);
         println!(" Bond \n{}", s);
         assert!(s.starts_with("H v0.4"));
         assert!(s.contains("B B0 G0 N0 N1"));
@@ -579,7 +585,7 @@ mod tests {
         g.add_edge(NodeId(0), NodeId(0));
         g.add_edge(NodeId(1), NodeId(1));
         let res = build_spqr(&g);
-        let s = to_spqr_string(&g, &res);
+        let s = to_spqr_string(&g, &res, 0);
         println!(" Self loops \n{}", s);
         assert!(s.contains("E E3 G0 N0 N0"));
         assert!(s.contains("E E4 G0 N1 N1"));
@@ -592,7 +598,7 @@ mod tests {
         g.add_edge(NodeId(0), NodeId(0));
         g.add_edge(NodeId(0), NodeId(0));
         let res = build_spqr(&g);
-        let s = to_spqr_string(&g, &res);
+        let s = to_spqr_string(&g, &res, 0);
         println!(" Only self loops \n{}", s);
         assert!(s.contains("E E0 G0 N0 N0"));
         assert!(s.contains("E E1 G0 N0 N0"));
@@ -605,7 +611,7 @@ mod tests {
         g.add_nodes(2);
         g.add_edge(NodeId(0), NodeId(1));
         let res = build_spqr(&g);
-        let s = to_spqr_string(&g, &res);
+        let s = to_spqr_string(&g, &res, 0);
         println!(" Single edge \n{}", s);
         assert!(s.contains("B B0 G0 N0 N1"));
         assert!(s.contains("E E0 B0 N0 N1"));
@@ -615,7 +621,7 @@ mod tests {
     fn test_tree_only_format() {
         let g = make_k4();
         let tree = build_spqr_tree(&g);
-        let s = tree_to_spqr_string(&g, &tree);
+        let s = tree_to_spqr_string(&g, &tree, 0);
         println!("K4 tree only n{}", s);
         assert!(s.starts_with("H v0.4"));
         assert!(!s.contains("Self-loop"));
@@ -631,7 +637,7 @@ mod tests {
         g.add_edge(NodeId(0), NodeId(3));
         g.add_edge(NodeId(3), NodeId(1));
         let res = build_spqr(&g);
-        let s = to_spqr_string(&g, &res);
+        let s = to_spqr_string(&g, &res, 0);
         println!(" Two triangles \n{}", s);
         assert!(s.contains("B B0 G0"));
         assert!(s.contains("V V"));
@@ -644,7 +650,7 @@ mod tests {
 
     fn validate_roundtrip(g: &Graph, label: &str) {
         let res = build_spqr(g);
-        let s = to_spqr_string(g, &res);
+        let s = to_spqr_string(g, &res, 0);
         let parsed = parse_spqr_format(&s).expect("Failed to parse .spqr format");
         if let Err(errors) = validate_spqr_format(&parsed, g, &res) {
             panic!(

@@ -11,7 +11,10 @@ fn main() {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
-        eprintln!("Usage: {} <graph_file|gfa_file>", args[0]);
+        eprintln!(
+            "Usage: {} <graph_file|gfa_file> [spqr_output_file]",
+            args[0]
+        );
         eprintln!("Graph file format: lines of 'node1 node2' (names or 0-indexed numbers)");
         eprintln!("GFA file format: GFA version 1");
         std::process::exit(1);
@@ -170,7 +173,7 @@ fn main() {
 
     components.sort_by_key(|c| Reverse(c.len()));
 
-    if let Some(comp) = components.first() {
+    if let Some((component_id, comp)) = components.iter().enumerate().next() {
         if comp.len() < 2 {
             println!(
                 "Largest component has {} node(s), SPQR tree requires at least 2",
@@ -213,7 +216,7 @@ fn main() {
 
         if spqr.len() <= 20 {
             println!("\nTree structure:");
-            let output = spqr_rust::spqr_format::to_spqr_string(&subgraph, &result);
+            let output = spqr_rust::spqr_format::to_spqr_string(&subgraph, &result, component_id);
             println!("{}", output);
         }
     }
